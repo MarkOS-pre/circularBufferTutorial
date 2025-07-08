@@ -29,5 +29,15 @@ private:
     // access the processor object that created it.
     CircularBufferTutorialAudioProcessor& audioProcessor;
 
+    juce::Slider delaySlider;
+    juce::Slider feedbackSlider;
+    juce::Slider volumeSlider;
+    juce::Slider dryWetSlider;
+
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> timeknob;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> feedbackKnob;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> volumeKnob;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> dryWetKnob;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CircularBufferTutorialAudioProcessorEditor)
 };

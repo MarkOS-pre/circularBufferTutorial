@@ -19,7 +19,11 @@ CircularBufferTutorialAudioProcessor::CircularBufferTutorialAudioProcessor()
                       #endif
                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
                      #endif
-                       )
+                       ),
+                    tree(*this, nullptr, "params", {std::make_unique<juce::AudioParameterFloat>(TIME_ID, TIME_NAME, 0.1f, 2000.0f, 500.0f),
+                                                    std::make_unique<juce::AudioParameterFloat>(FEEDBACK_ID, FEEDBACK_NAME, 0.0f, 0.7f, 0.1f),
+                                                    std::make_unique<juce::AudioParameterFloat>(LEVEL_ID, LEVEL_NAME, 0.0f, 1.0f, 0.8f),
+                                                    std::make_unique<juce::AudioParameterFloat>(DRYWET_ID, DRYWET_NAME, 0.0f, 1.0f, 0.5f)})
 #endif
 {
 }
@@ -97,6 +101,15 @@ void CircularBufferTutorialAudioProcessor::prepareToPlay (double sampleRate, int
     const int delayBufferSize = 2 * (sampleRate + samplesPerBlock);
     mSampleRate = sampleRate;
     nDelayBuffer.setSize(numInputChannels, delayBufferSize);
+    nDelayBuffer.clear();
+
+    dryWetMixer.setMixingRule(juce::dsp::DryWetMixingRule::sin3dB); // o sinCos para más natural
+    dryWetMixer.setWetLatency(0); // importante si el delay genera latencia (este no lo hace)
+    dryWetMixer.prepare({ sampleRate, (juce::uint32)samplesPerBlock, (juce::uint32)getTotalNumOutputChannels() });
+
+    smoothedMix.reset(sampleRate, 0.05);
+
+
 }
 
 void CircularBufferTutorialAudioProcessor::releaseResources()
@@ -145,16 +158,29 @@ void CircularBufferTutorialAudioProcessor::processBlock (juce::AudioBuffer<float
     const int bufferLength = buffer.getNumSamples();
     const int delayBufferLength = nDelayBuffer.getNumSamples();
 
+    smoothedMix.setTargetValue(*tree.getRawParameterValue(DRYWET_ID));
+    dryWetMixer.setWetMixProportion(smoothedMix.getNextValue());
+    dryWetMixer.pushDrySamples(buffer);  // Guarda copia del dry
+
 
     for (int channel = 0; channel < totalNumInputChannels; ++channel)
     {
         
         const float* bufferData = buffer.getReadPointer(channel);
         const float* delayBufferData = nDelayBuffer.getReadPointer(channel);
+        const float* wetBufferData = buffer.getReadPointer(channel);
 
+        
+        
         fillDelayBuffer(channel, bufferLength, delayBufferLength, bufferData, delayBufferData);
         getFromDelayBuffer(buffer, channel, bufferLength, delayBufferLength, bufferData, delayBufferData);
+        feedbackDelay(channel, bufferLength, delayBufferLength, wetBufferData);
+
+
+
     }
+
+    dryWetMixer.mixWetSamples(buffer);   //mezclo con el buffer procesado
 
     nWritePosition += bufferLength;
     nWritePosition %= delayBufferLength;   //calculamos el resto para evitar que el nWritter se pase del tamaño del bufferDelay
@@ -163,38 +189,68 @@ void CircularBufferTutorialAudioProcessor::processBlock (juce::AudioBuffer<float
 
 void CircularBufferTutorialAudioProcessor::fillDelayBuffer(int channel, const int bufferLength, const int delayBufferLength, const float* bufferData, const float* delayBufferData)
 {
+
+    float levelDelay = *tree.getRawParameterValue(LEVEL_ID);
     //Copiar los datos del main buffer al delay buffer
     if (delayBufferLength > bufferLength + nWritePosition)
     {
-        nDelayBuffer.copyFromWithRamp(channel, nWritePosition, bufferData, bufferLength, 0.8, 0.8);
+        nDelayBuffer.copyFromWithRamp(channel, nWritePosition, bufferData, bufferLength, levelDelay, levelDelay);
 
     }
     else {
         const int bufferRemaining = delayBufferLength - nWritePosition;
 
-        nDelayBuffer.copyFromWithRamp(channel, nWritePosition, bufferData, bufferRemaining, 0.8, 0.8);
-        nDelayBuffer.copyFromWithRamp(channel, 0, bufferData, bufferLength - bufferRemaining, 0.8, 0.8);
+        nDelayBuffer.copyFromWithRamp(channel, nWritePosition, bufferData, bufferRemaining, levelDelay, levelDelay);
+        nDelayBuffer.copyFromWithRamp(channel, 0, bufferData + bufferRemaining, bufferLength - bufferRemaining, levelDelay, levelDelay);
     }
 
     
 }
 
+float CircularBufferTutorialAudioProcessor::getWobble()
+{
+    float wobble = std::sin(2.0f * juce::MathConstants<float>::pi * wobblePhase) * wobbleDepth;
+    wobblePhase += wobbleRate / mSampleRate;
+
+    if (wobblePhase >= 1.0f)
+        wobblePhase -= 1.0f;
+    return wobble;
+}
+
 void CircularBufferTutorialAudioProcessor::getFromDelayBuffer(juce::AudioBuffer<float>& buffer, int channel, const int bufferLength, const int delayBufferLength, const float* bufferData, const float* delayBufferData)
 {
-    int delayTime = 500;
-    const int readPosition = static_cast<int> (delayBufferLength + nWritePosition - (mSampleRate * delayTime / 1000)) % delayBufferLength;
+    float wobble = getWobble();
+
+    int delayTime = *tree.getRawParameterValue(TIME_ID);
+    const int readPosition = static_cast<int> (delayBufferLength + nWritePosition - (mSampleRate * delayTime / 1000) + wobble) % delayBufferLength;
 
     if (delayBufferLength > bufferLength + readPosition)
     {
-        buffer.addFrom(channel, 0, delayBufferData + readPosition, bufferLength);
+        buffer.copyFrom(channel, 0, delayBufferData + readPosition, bufferLength);
     }
     else 
     {
         const int bufferRemaining = delayBufferLength - readPosition;
-        buffer.addFrom(channel, 0, delayBufferData + readPosition, bufferRemaining);
-        buffer.addFrom(channel, bufferRemaining, delayBufferData, bufferLength - bufferRemaining);
+        buffer.copyFrom(channel, 0, delayBufferData + readPosition, bufferRemaining);
+        buffer.copyFrom(channel, bufferRemaining, delayBufferData, bufferLength - bufferRemaining);
     }
 }
+
+void CircularBufferTutorialAudioProcessor::feedbackDelay( int channel, const int bufferLength, const int delayBufferLength, const float* wetBuffer)
+{
+    float feedback = juce::jlimit(0.0f, 0.7f, static_cast<float>(*tree.getRawParameterValue(FEEDBACK_ID)));;
+
+    if (delayBufferLength > bufferLength + nWritePosition)
+    {
+        nDelayBuffer.addFromWithRamp(channel, nWritePosition, wetBuffer, bufferLength, feedback, feedback);
+    }
+    else {
+        const int bufferReamining = delayBufferLength - nWritePosition;
+        nDelayBuffer.addFromWithRamp(channel, bufferReamining, wetBuffer, bufferReamining, feedback, feedback);
+        nDelayBuffer.addFromWithRamp(channel, 0, wetBuffer, bufferLength - bufferReamining, feedback, feedback);
+    }
+}
+
 //==============================================================================
 bool CircularBufferTutorialAudioProcessor::hasEditor() const
 {
